@@ -1,0 +1,1233 @@
+# SPDX-FileCopyrightText: 2022 James R. Barlow
+# SPDX-License-Identifier: MPL-2.0
+
+"""Implement some features in Python and monkey-patch them onto C++ classes.
+
+In several cases the implementation of some higher levels features might as
+well be in Python. Fortunately we can attach Python methods to C++ class
+bindings after the fact.
+
+We can also move the implementation to C++ if desired.
+"""
+
+from __future__ import annotations
+
+import datetime
+import mimetypes
+import shutil
+from collections.abc import (
+    Callable,
+    ItemsView,
+    Iterable,
+    Iterator,
+    KeysView,
+    MutableMapping,
+    ValuesView,
+)
+from contextlib import ExitStack, contextmanager, suppress
+from decimal import Decimal
+from io import BytesIO
+from pathlib import Path
+from subprocess import run
+from tempfile import TemporaryDirectory
+from typing import TYPE_CHECKING, BinaryIO, Literal, TypeVar
+from warnings import warn
+
+if TYPE_CHECKING:
+    from pikepdf._page_copy import PageCopyResult
+
+from pikepdf._augments import augment_override_cpp, augments
+from pikepdf._core import (
+    AccessMode,
+    AttachedFile,
+    AttachedFileSpec,
+    Attachments,
+    JSONStreamData,
+    NameTree,
+    NumberTree,
+    ObjectStreamMode,
+    ObjectType,
+    Page,
+    Pdf,
+    Rectangle,
+    StreamDecodeLevel,
+    StreamParser,
+    Token,
+    _ObjectMapping,
+)
+from pikepdf._exceptions import PageCopyWarning
+from pikepdf._io import atomic_overwrite, check_different_files, check_stream_is_usable
+from pikepdf.models import Encryption, EncryptionInfo, Outline, Permissions
+from pikepdf.models.metadata import PdfMetadata, decode_pdf_date, encode_pdf_date
+from pikepdf.objects import Array, Dictionary, Name, Object, Stream
+
+# pylint: disable=no-member,unsupported-membership-test,unsubscriptable-object
+# mypy: ignore-errors
+
+__all__ = []
+
+Numeric = TypeVar('Numeric', int, float, Decimal)
+T = TypeVar('T')
+
+# Sentinel for distinguishing "no default provided" from "default=None"
+_MISSING = object()
+
+
+def _single_page_pdf(page: Page) -> bytes:
+    """Construct a single page PDF from the provided page in memory."""
+    pdf = Pdf.new()
+    pdf.pages.append(page)
+    bio = BytesIO()
+    pdf.save(bio)
+    bio.seek(0)
+    return bio.read()
+
+
+def _run_mudraw(in_path: Path, out_pattern: Path) -> Path:
+    run(
+        ['mutool', 'draw', '-o', str(out_pattern), str(in_path)],
+        check=True,
+    )
+    out_path = out_pattern.with_name(out_pattern.name.format(1))  # Replace %d with 1
+    if not out_path.exists():
+        raise FileNotFoundError(out_path)
+    return out_path
+
+
+def _mudraw(buffer: bytes | memoryview, fmt: Literal["svg"]) -> bytes:
+    """Use mupdf draw to rasterize the PDF in the memory buffer."""
+    # mudraw cannot read from stdin so a temporary file is required
+    # '-o -' does not work on macos-14
+    # '-o <path>' can accidentally prepend numbers to dots, so use explicit %d
+    # instead; see https://bugs.ghostscript.com/show_bug.cgi?id=708653
+    with TemporaryDirectory() as tmp_dir:
+        in_path = Path(tmp_dir) / 'input.pdf'
+        out_pattern = Path(tmp_dir) / f'output%d.{fmt}'
+        out_path = Path(tmp_dir) / f'output1.{fmt}'
+        in_path.write_bytes(buffer)
+        out_path = _run_mudraw(in_path, out_pattern)
+        return out_path.read_bytes()
+
+
+@augments(Object)
+class Extend_Object:
+    def _ipython_key_completions_(self):
+        if isinstance(self, Dictionary | Stream):
+            return self.keys()
+        return None
+
+    def emplace(self, other: Object, retain: Iterable[Name] | None = None):
+        if not self.same_owner_as(other):
+            raise TypeError("Objects must have the same owner for emplace()")
+
+        # Default to (Name.Parent,) lazily so that importing this module does
+        # not allocate a persistent pikepdf.Object instance in the function's
+        # __defaults__ tuple (which nanobind reports as a shutdown leak).
+        if retain is None:
+            retain = (Name.Parent,)
+
+        # .keys() returns strings, so make all strings
+        retain_set: set[str] = {str(k) for k in retain}
+        self_keys = set(self.keys())
+        other_keys = set(other.keys())
+
+        assert all(isinstance(k, str) for k in (retain_set | self_keys | other_keys))
+
+        del_keys = self_keys - other_keys - retain_set
+        for k in (k for k in other_keys if k not in retain_set):
+            self[k] = other[k]  # pylint: disable=unsupported-assignment-operation
+        for k in del_keys:
+            del self[k]  # pylint: disable=unsupported-delete-operation
+
+    def _type_check_write(self, filter_, decode_parms):
+        if isinstance(filter_, list):
+            filter_ = Array(filter_)
+        filter_ = filter_.wrap_in_array()
+
+        if isinstance(decode_parms, list):
+            decode_parms = Array(decode_parms)
+        elif decode_parms is None:
+            decode_parms = Array([])
+        else:
+            decode_parms = decode_parms.wrap_in_array()
+
+        if not all(isinstance(item, Name) for item in filter_):
+            raise TypeError(
+                "filter must be: pikepdf.Name or pikepdf.Array([pikepdf.Name])"
+            )
+        if not all(
+            (isinstance(item, Dictionary) or item is None) for item in decode_parms
+        ):
+            raise TypeError(
+                "decode_parms must be: pikepdf.Dictionary or "
+                "pikepdf.Array([pikepdf.Dictionary])"
+            )
+        if len(decode_parms) != 0 and len(filter_) != len(decode_parms):
+            raise ValueError(
+                f"filter ({repr(filter_)}) and decode_parms "
+                f"({repr(decode_parms)}) must be arrays of same length"
+            )
+        if len(filter_) == 1:
+            filter_ = filter_[0]
+        if len(decode_parms) == 0:
+            decode_parms = None
+        elif len(decode_parms) == 1:
+            decode_parms = decode_parms[0]
+        return filter_, decode_parms
+
+    def write(
+        self,
+        data: bytes,
+        *,
+        filter: Name | Array | None = None,
+        decode_parms: Dictionary | Array | None = None,
+        type_check: bool = True,
+    ):  # pylint: disable=redefined-builtin
+        if type_check and filter is not None:
+            filter, decode_parms = self._type_check_write(filter, decode_parms)
+
+        self._write(data, filter=filter, decode_parms=decode_parms)
+
+    def as_int(self, default: T = _MISSING) -> int | T:
+        """Convert to int, or return default if not an integer.
+
+        In explicit conversion mode, this provides a safe way to convert
+        pikepdf.Integer to Python int with proper type hints.
+
+        Args:
+            default: Value to return if this object is not an integer.
+                If not provided and the object is not an integer,
+                raises TypeError.
+
+        Returns:
+            The integer value, or the default if provided and object is
+            not an integer.
+
+        Raises:
+            TypeError: If object is not an integer and no default was provided.
+
+        .. versionadded:: 10.1
+        """
+        if self._type_code != ObjectType.integer:
+            if default is _MISSING:
+                raise TypeError(f"Expected integer, got {self._type_name}")
+            return default
+        return int(self)
+
+    def as_bool(self, default: T = _MISSING) -> bool | T:
+        """Convert to bool, or return default if not a boolean.
+
+        In explicit conversion mode, this provides a safe way to convert
+        pikepdf.Boolean to Python bool with proper type hints.
+
+        Args:
+            default: Value to return if this object is not a boolean.
+                If not provided and the object is not a boolean,
+                raises TypeError.
+
+        Returns:
+            The boolean value, or the default if provided and object is
+            not a boolean.
+
+        Raises:
+            TypeError: If object is not a boolean and no default was provided.
+
+        .. versionadded:: 10.1
+        """
+        if self._type_code != ObjectType.boolean:
+            if default is _MISSING:
+                raise TypeError(f"Expected boolean, got {self._type_name}")
+            return default
+        return bool(self)
+
+    def as_float(self, default: T = _MISSING) -> float | T:
+        """Convert to float, or return default if not numeric.
+
+        Works for both Integer and Real objects.
+
+        Args:
+            default: Value to return if this object is not numeric.
+                If not provided and the object is not numeric,
+                raises TypeError.
+
+        Returns:
+            The float value, or the default if provided and object is
+            not numeric.
+
+        Raises:
+            TypeError: If object is not numeric and no default was provided.
+
+        .. versionadded:: 10.1
+        """
+        if self._type_code not in (ObjectType.integer, ObjectType.real):
+            if default is _MISSING:
+                raise TypeError(f"Expected numeric, got {self._type_name}")
+            return default
+        return float(self)
+
+    def as_decimal(self, default: T = _MISSING) -> Decimal | T:
+        """Convert to Decimal, or return default if not a Real.
+
+        Preferred over as_float() for PDF reals to preserve precision.
+        Only works for Real objects, not Integer.
+
+        Args:
+            default: Value to return if this object is not a Real.
+                If not provided and the object is not a Real,
+                raises TypeError.
+
+        Returns:
+            The Decimal value, or the default if provided and object is
+            not a Real.
+
+        Raises:
+            TypeError: If object is not a Real and no default was provided.
+
+        .. versionadded:: 10.1
+        """
+        if self._type_code != ObjectType.real:
+            if default is _MISSING:
+                raise TypeError(f"Expected real, got {self._type_name}")
+            return default
+        return Decimal(self._get_real_value())
+
+
+@augments(Pdf)
+class Extend_Pdf:
+    @contextmanager
+    def lock(self):
+        """Context manager to hold the per-Pdf lock for compound operations.
+
+        Under free-threaded Python, individual C++ method calls are
+        automatically serialized, but multi-step Python operations (e.g.
+        read-modify-write on the same dictionary) are not atomic.  Wrap
+        such sequences in ``with pdf.lock():`` to prevent interleaving.
+
+        On GIL-enabled builds this is a no-op.
+        """
+        self._acquire_lock()
+        try:
+            yield
+        finally:
+            self._release_lock()
+
+    def _quick_save(self):
+        bio = BytesIO()
+        self.save(bio)
+        bio.seek(0)
+        return bio
+
+    def _repr_mimebundle_(self, include=None, exclude=None):  # pylint: disable=unused-argument
+        pdf_data = self._quick_save().read()
+        data = {
+            'application/pdf': pdf_data,
+        }
+        with suppress(FileNotFoundError, RuntimeError):
+            data['image/svg+xml'] = _mudraw(pdf_data, 'svg').decode('utf-8')
+        return data
+
+    @property
+    def docinfo(self) -> Dictionary:
+        with self.lock():
+            if Name.Info not in self.trailer or not isinstance(
+                self.trailer.Info, Dictionary
+            ):
+                self.trailer.Info = self.make_indirect(Dictionary())
+            if not self.trailer.Info.is_indirect:
+                self.trailer.Info = self.make_indirect(self.trailer.Info)
+            return self.trailer.Info
+
+    @docinfo.setter
+    def docinfo(self, new_docinfo: Dictionary):
+        with self.lock():
+            if not new_docinfo.is_indirect:
+                raise ValueError(
+                    "docinfo must be an indirect object - use Pdf.make_indirect"
+                )
+            self.trailer.Info = new_docinfo
+
+    @docinfo.deleter
+    def docinfo(self):
+        with self.lock():
+            if Name.Info in self.trailer:
+                del self.trailer.Info
+
+    def open_metadata(
+        self,
+        set_pikepdf_as_editor: bool = True,
+        update_docinfo: bool = True,
+        strict: bool = False,
+    ) -> PdfMetadata:
+        return PdfMetadata(
+            self,
+            pikepdf_mark=set_pikepdf_as_editor,
+            sync_docinfo=update_docinfo,
+            overwrite_invalid_xml=not strict,
+        )
+
+    def open_outline(self, max_depth: int = 15, strict: bool = False) -> Outline:
+        return Outline(self, max_depth=max_depth, strict=strict)
+
+    def make_stream(self, data: bytes, d=None, **kwargs) -> Stream:
+        return Stream(self, data, d, **kwargs)
+
+    def add_blank_page(
+        self, *, page_size: tuple[Numeric, Numeric] = (612.0, 792.0)
+    ) -> Page:
+        for dim in page_size:
+            if not (3 <= dim <= 14400):
+                raise ValueError('Page size must be between 3 and 14400 PDF units')
+
+        with self.lock():
+            page_dict = Dictionary(
+                Type=Name.Page,
+                MediaBox=Array([0, 0, page_size[0], page_size[1]]),
+                Contents=self.make_stream(b''),
+                Resources=Dictionary(),
+            )
+            page_obj = self.make_indirect(page_dict)
+            self._add_page(page_obj, first=False)
+            return Page(page_obj)
+
+    def add_pages_from(
+        self,
+        src: Pdf,
+        pages: Iterable[int] | range | slice | None = None,
+        *,
+        forms: Literal['preserve', 'strip'] = 'preserve',
+    ) -> PageCopyResult:
+        """Append pages from another ``Pdf``, preserving interactive form fields.
+
+        Unlike ``pdf.pages.extend(src.pages)``, this carries the document's
+        AcroForm form fields so they remain functional in Adobe Acrobat. Fields
+        whose fully-qualified names collide with existing fields are
+        automatically renamed; see the returned :class:`pikepdf.PageCopyResult`.
+        The original→new name mapping in ``renamed_fields`` is best-effort
+        (it pairs source and destination page fields positionally).
+
+        Independent top-level fields are only carried over when a widget is on a
+        copied page, so unrelated forms on separate pages are not imported.
+        However, a field sharing a top-level ancestor with a copied field is
+        carried as an entire subtree; such partially-represented fields are
+        listed in the result's ``partial_fields``. Use ``forms='strip'`` for a
+        hard guarantee of no form data.
+
+        Named destinations referenced by the copied pages' annotations (such as
+        table-of-contents links) are carried into this document, preserving both
+        the ``Names.Dests`` name tree and the legacy ``Root.Dests`` dictionary.
+        A destination whose target page is not among the copied pages cannot be
+        migrated and is reported in :attr:`pikepdf.PageCopyResult.dropped_dests`;
+        names that collide with existing destinations are renamed and reported in
+        :attr:`pikepdf.PageCopyResult.renamed_dests`.
+
+        Args:
+            src: Source ``Pdf`` to copy pages from.
+            pages: Zero-based indices (iterable, ``range`` or ``slice``) of
+                pages in ``src`` to copy. ``None`` copies all pages.
+                A ``slice`` is clamped to the document length; explicit indices
+                (including ``range``) must be valid or ``IndexError`` is raised.
+            forms: ``'preserve'`` (default) carries form fields; ``'strip'``
+                removes widget annotations from the copied pages.
+
+        Returns:
+            A :class:`pikepdf.PageCopyResult` describing the operation.
+        """
+        from pikepdf._page_copy import copy_pages
+
+        return copy_pages(self, src, pages, forms=forms)
+
+    def close(self) -> None:
+        self._close()
+        if getattr(self, '_tmp_stream', None):
+            self._tmp_stream.close()
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, exc_type, exc_value, traceback):
+        self.close()
+
+    @property
+    def allow(self) -> Permissions:
+        results = {}
+        for field in Permissions._fields:
+            results[field] = getattr(self, '_allow_' + field)
+        return Permissions(**results)
+
+    @property
+    def encryption(self) -> EncryptionInfo:
+        return EncryptionInfo(self._encryption_data)
+
+    def check_pdf_syntax(
+        self, progress: Callable[[int], None] | None = None
+    ) -> list[str]:
+        class DiscardingParser(StreamParser):
+            def __init__(self):  # pylint: disable=useless-super-delegation
+                super().__init__()  # required for C++
+
+            def handle_object(self, *_args):
+                pass
+
+            def handle_eof(self):
+                pass
+
+        problems: list[str] = []
+
+        self._decode_all_streams_and_discard(progress)
+
+        discarding_parser = DiscardingParser()
+        for page in self.pages:
+            page.parse_contents(discarding_parser)
+
+        for warning in self.get_warnings():
+            problems.append("WARNING: " + warning)
+
+        return problems
+
+    def save(
+        self,
+        filename_or_stream: Path | str | BinaryIO | None = None,
+        *,
+        static_id: bool = False,
+        preserve_pdfa: bool = True,
+        min_version: str | tuple[str, int] = "",
+        force_version: str | tuple[str, int] = "",
+        fix_metadata_version: bool = True,
+        compress_streams: bool = True,
+        stream_decode_level: StreamDecodeLevel | None = None,
+        object_stream_mode: ObjectStreamMode = ObjectStreamMode.preserve,
+        normalize_content: bool = False,
+        linearize: bool = False,
+        qdf: bool = False,
+        progress: Callable[[int], None] | None = None,
+        encryption: Encryption | bool | None = None,
+        recompress_flate: bool = False,
+        deterministic_id: bool = False,
+    ) -> None:
+        if not filename_or_stream and getattr(self, '_original_filename', None):
+            filename_or_stream = self._original_filename
+        if not filename_or_stream:
+            raise ValueError(
+                "Cannot save to original filename because the original file was "
+                "not opening using Pdf.open(..., allow_overwriting_input=True). "
+                "Either specify a new destination filename/file stream or open "
+                "with allow_overwriting_input=True. If this Pdf was created using "
+                "Pdf.new(), you must specify a destination object since there is "
+                "no original filename to save to."
+            )
+        orphans = self._count_orphaned_widgets()
+        if orphans:
+            warn(
+                f"This document has {orphans} form widget annotation(s) that are "
+                "not reachable from /AcroForm; they may not display in Adobe "
+                "Acrobat. Use Pdf.add_pages_from() to copy pages with forms.",
+                PageCopyWarning,
+            )
+        with ExitStack() as stack:
+            if hasattr(filename_or_stream, 'seek'):
+                stream = filename_or_stream
+                check_stream_is_usable(filename_or_stream)
+            else:
+                if not isinstance(filename_or_stream, str | bytes | Path):
+                    raise TypeError("expected str, bytes or os.PathLike object")
+                filename = Path(filename_or_stream)
+                if (
+                    not getattr(self, '_tmp_stream', None)
+                    and getattr(self, '_original_filename', None) is not None
+                ):
+                    check_different_files(self._original_filename, filename)
+                stream = stack.enter_context(atomic_overwrite(filename))
+            self._save(
+                stream,
+                static_id=static_id,
+                preserve_pdfa=preserve_pdfa,
+                min_version=min_version,
+                force_version=force_version,
+                fix_metadata_version=fix_metadata_version,
+                compress_streams=compress_streams,
+                stream_decode_level=stream_decode_level,
+                object_stream_mode=object_stream_mode,
+                normalize_content=normalize_content,
+                linearize=linearize,
+                qdf=qdf,
+                progress=progress,
+                encryption=encryption,
+                samefile_check=getattr(self, '_tmp_stream', None) is None,
+                recompress_flate=recompress_flate,
+                deterministic_id=deterministic_id,
+            )
+
+    def write_qpdf_json(
+        self,
+        filename_or_stream: Path | str | BinaryIO,
+        *,
+        decode_level: StreamDecodeLevel = StreamDecodeLevel.generalized,
+        json_stream_data: JSONStreamData = JSONStreamData.inline,
+        file_prefix: str = "",
+    ) -> None:
+        """Write this PDF as qpdf JSON (the ``qpdf --json-output`` format, version 2).
+
+        This is the whole-document JSON serialization, distinct from
+        :meth:`pikepdf.Object.to_json` which serializes a single object. The output
+        can be read back with :meth:`Pdf.from_qpdf_json`.
+
+        Args:
+            filename_or_stream: A filename or writable binary stream.
+            decode_level: How much to decode (uncompress) stream data in the JSON.
+                Use :attr:`StreamDecodeLevel.none` to preserve stream data exactly.
+            json_stream_data: How stream data is represented:
+                :attr:`JSONStreamData.inline` (base64 in the JSON),
+                :attr:`JSONStreamData.file` (written to external files using
+                ``file_prefix``), or :attr:`JSONStreamData.none` (omitted).
+            file_prefix: Required when ``json_stream_data`` is
+                :attr:`JSONStreamData.file`; each stream is written to a file named
+                ``{file_prefix}-{object_number}``.
+        """
+        if json_stream_data == JSONStreamData.file and not file_prefix:
+            if isinstance(filename_or_stream, str | Path):
+                file_prefix = str(filename_or_stream)
+            else:
+                raise ValueError(
+                    "file_prefix is required when json_stream_data is "
+                    "JSONStreamData.file and a stream (rather than a filename) "
+                    "is given"
+                )
+        with ExitStack() as stack:
+            if hasattr(filename_or_stream, 'seek'):
+                stream = filename_or_stream
+                check_stream_is_usable(filename_or_stream)
+            else:
+                if not isinstance(filename_or_stream, str | bytes | Path):
+                    raise TypeError("expected str, bytes or os.PathLike object")
+                stream = stack.enter_context(atomic_overwrite(Path(filename_or_stream)))
+            self._write_qpdf_json(
+                stream,
+                decode_level=decode_level,
+                json_stream_data=json_stream_data,
+                file_prefix=file_prefix,
+            )
+
+    @staticmethod
+    def from_qpdf_json(filename_or_stream: Path | str | BinaryIO) -> Pdf:
+        """Create a new Pdf from qpdf JSON, as written by :meth:`Pdf.write_qpdf_json`.
+
+        The JSON must be a complete representation of a PDF (``qpdf --json-output``
+        version 2 or higher). To merge JSON into an existing Pdf, use
+        :meth:`Pdf.update_from_qpdf_json` instead.
+
+        Args:
+            filename_or_stream: A filename or readable binary stream containing
+                qpdf JSON.
+        """
+        with ExitStack() as stack:
+            if hasattr(filename_or_stream, 'read'):
+                stream = filename_or_stream
+                description = f"stream {stream}"
+            else:
+                stream = stack.enter_context(open(filename_or_stream, 'rb'))
+                description = str(filename_or_stream)
+            return Pdf._from_qpdf_json(stream, description=description)
+
+    def update_from_qpdf_json(self, filename_or_stream: Path | str | BinaryIO) -> None:
+        """Update this Pdf from qpdf JSON, as written by :meth:`Pdf.write_qpdf_json`.
+
+        Objects present in this Pdf but absent from the JSON are left unchanged.
+        See :meth:`Pdf.from_qpdf_json` to create a new Pdf instead.
+
+        Args:
+            filename_or_stream: A filename or readable binary stream containing
+                qpdf JSON.
+        """
+        with ExitStack() as stack:
+            if hasattr(filename_or_stream, 'read'):
+                stream = filename_or_stream
+                description = f"stream {stream}"
+            else:
+                stream = stack.enter_context(open(filename_or_stream, 'rb'))
+                description = str(filename_or_stream)
+            self._update_from_qpdf_json(stream, description=description)
+
+    @staticmethod
+    def open(
+        filename_or_stream: Path | str | BinaryIO,
+        *,
+        password: str | bytes = "",
+        hex_password: bool = False,
+        ignore_xref_streams: bool = False,
+        suppress_warnings: bool = True,
+        attempt_recovery: bool = True,
+        inherit_page_attributes: bool = True,
+        access_mode: AccessMode = AccessMode.default,
+        allow_overwriting_input: bool = False,
+    ) -> Pdf:
+        if isinstance(filename_or_stream, bytes) and filename_or_stream.startswith(
+            b'%PDF-'
+        ):
+            warn(
+                "It looks like you called with Pdf.open(data) with a bytes-like object "
+                "containing a PDF. This will probably fail because this function "
+                "expects a filename or opened file-like object. Instead, please use "
+                "Pdf.open(BytesIO(data))."
+            )
+        if isinstance(filename_or_stream, int | float):
+            # Attempted to open with integer file descriptor?
+            # TODO improve error
+            raise TypeError("expected str, bytes or os.PathLike object")
+
+        stream: BinaryIO | None = None
+        closing_stream: bool = False
+        original_filename: Path | None = None
+
+        if allow_overwriting_input:
+            try:
+                Path(filename_or_stream)
+            except TypeError as error:
+                raise ValueError(
+                    '"allow_overwriting_input=True" requires "open" first argument '
+                    'to be a file path'
+                ) from error
+            original_filename = Path(filename_or_stream)
+            with open(original_filename, 'rb') as pdf_file:
+                stream = BytesIO()
+                shutil.copyfileobj(pdf_file, stream)
+                stream.seek(0)
+            # description = f"memory copy of {original_filename}"
+            description = str(original_filename)
+        elif hasattr(filename_or_stream, 'read') and hasattr(
+            filename_or_stream, 'seek'
+        ):
+            stream = filename_or_stream
+            description = f"stream {stream}"
+        else:
+            stream = open(filename_or_stream, 'rb')
+            original_filename = Path(filename_or_stream)
+            description = str(filename_or_stream)
+            closing_stream = True
+
+        try:
+            check_stream_is_usable(stream)
+            pdf = Pdf._open(
+                stream,
+                password=password,
+                hex_password=hex_password,
+                ignore_xref_streams=ignore_xref_streams,
+                suppress_warnings=suppress_warnings,
+                attempt_recovery=attempt_recovery,
+                inherit_page_attributes=inherit_page_attributes,
+                access_mode=access_mode,
+                description=description,
+                closing_stream=closing_stream,
+            )
+        except Exception:
+            if stream is not None and closing_stream:
+                stream.close()
+            raise
+        pdf._tmp_stream = stream if allow_overwriting_input else None
+        pdf._original_filename = original_filename
+        return pdf
+
+
+@augments(_ObjectMapping)
+class Extend_ObjectMapping:
+    def get(self, key, default: T | None = None) -> Object | T | None:
+        try:
+            return self[key]
+        except KeyError:
+            return default
+
+    @augment_override_cpp
+    def __contains__(self, key: Name | str) -> bool:
+        if isinstance(key, Name):
+            key = str(key)
+        return _ObjectMapping._cpp__contains__(self, key)
+
+    @augment_override_cpp
+    def __getitem__(self, key: Name | str) -> Object:
+        if isinstance(key, Name):
+            key = str(key)
+        return _ObjectMapping._cpp__getitem__(self, key)
+
+
+def check_is_box(obj) -> None:
+    with suppress(AttributeError):
+        if obj.is_rectangle:
+            return
+    try:
+        pdfobj = Array(obj)
+        if pdfobj.is_rectangle:
+            return
+    except Exception as e:
+        raise ValueError("object is not a rectangle") from e
+    raise ValueError("object is not a rectangle")
+
+
+@augments(Page)
+class Extend_Page:
+    @property
+    def mediabox(self):
+        return self._get_mediabox(True)
+
+    @mediabox.setter
+    def mediabox(self, value):
+        check_is_box(value)
+        self.obj['/MediaBox'] = value
+
+    @property
+    def artbox(self):
+        return self._get_artbox(True, False)
+
+    @artbox.setter
+    def artbox(self, value):
+        check_is_box(value)
+        self.obj['/ArtBox'] = value
+
+    @property
+    def bleedbox(self):
+        return self._get_bleedbox(True, False)
+
+    @bleedbox.setter
+    def bleedbox(self, value):
+        check_is_box(value)
+        self.obj['/BleedBox'] = value
+
+    @property
+    def cropbox(self):
+        return self._get_cropbox(True, False)
+
+    @cropbox.setter
+    def cropbox(self, value):
+        check_is_box(value)
+        self.obj['/CropBox'] = value
+
+    @property
+    def trimbox(self):
+        return self._get_trimbox(True, False)
+
+    @trimbox.setter
+    def trimbox(self, value):
+        check_is_box(value)
+        self.obj['/TrimBox'] = value
+
+    @property
+    def rotation(self) -> int:
+        """The page's clockwise rotation in degrees, normalized to ``[0, 360)``.
+
+        Unlike the raw ``page.Rotate`` attribute, this property reports the
+        *effective* rotation: it resolves a ``/Rotate`` value inherited from the
+        page tree and reports ``0`` when no rotation is set, instead of raising.
+        Assigning to this property sets the absolute rotation; to rotate
+        relative to the current value, use :meth:`rotate` with ``relative=True``.
+
+        .. versionadded:: 10.9
+        """
+        return self._get_rotation()
+
+    @rotation.setter
+    def rotation(self, angle: int) -> None:
+        self.rotate(angle, relative=False)
+
+    @augment_override_cpp
+    def rotate(self, angle: int, /, *args: bool, relative: bool = False) -> None:  # noqa: D417
+        """Rotate this page.
+
+        If ``relative`` is ``False`` (the default), set the page's rotation to
+        ``angle``. If ``relative`` is ``True``, add ``angle`` to the page's
+        current rotation. ``angle`` must be a multiple of ``90``; a positive
+        angle rotates the page clockwise.
+
+        Args:
+            angle: Rotation angle in degrees, a multiple of ``90``.
+            relative: If ``True``, add ``angle`` to the current rotation; if
+                ``False``, set the rotation to ``angle``.
+
+        .. deprecated:: 10.9
+            Passing ``relative`` as a positional argument is deprecated; pass it
+            as a keyword argument instead, e.g. ``page.rotate(90, relative=True)``.
+        """
+        # TODO(pikepdf 11): drop positional support for ``relative`` -- change
+        # the signature to ``def rotate(self, angle, *, relative=False)`` and
+        # remove the ``*args`` deprecation shim below.
+        if args:
+            if len(args) > 1:
+                raise TypeError(
+                    f"rotate() takes at most 2 positional arguments but "
+                    f"{1 + len(args)} were given"
+                )
+            warn(
+                "Passing 'relative' as a positional argument to Page.rotate() "
+                "is deprecated; pass it as a keyword argument instead, e.g. "
+                "page.rotate(90, relative=True). Positional support will be "
+                "removed in pikepdf 11.",
+                DeprecationWarning,
+                stacklevel=2,
+            )
+            relative = args[0]
+        self._cpprotate(angle, bool(relative))
+
+    @property
+    def images(self) -> _ObjectMapping:
+        """Return images directly referenced by this page's resources.
+
+        .. deprecated:: 10.9
+            Use :meth:`get_images` instead. This property reports only images
+            referenced directly by the page and silently omits images nested
+            inside form XObjects. Because it is not visually obvious when a page's
+            content is wrapped in a form XObject, this often appears as if a page
+            "has no images" when it clearly does. :meth:`get_images` recurses into
+            form XObjects by default.
+        """
+        warn(
+            "Page.images is deprecated and will be removed in a future version. "
+            "Use Page.get_images() instead, which by default also finds images "
+            "nested inside form XObjects.",
+            DeprecationWarning,
+            stacklevel=2,
+        )
+        return self._images
+
+    def get_images(self, recursive: bool = True) -> _ObjectMapping:
+        """Return the images used by this page.
+
+        Args:
+            recursive: If True (the default), also report images nested inside
+                form XObjects referenced by this page, recursing to any depth.
+                This is usually what you want, since a page's visible content is
+                often drawn entirely through one or more form XObjects. If two
+                images in different XObject scopes happen to share a resource
+                name, only one of them is reported. If False, report only images
+                referenced directly by this page's resources.
+        """
+        if recursive:
+            return self._images_recursive
+        return self._images
+
+    @property
+    def form_xobjects(self) -> _ObjectMapping:
+        return self._form_xobjects
+
+    @property
+    def resources(self) -> Dictionary:
+        if Name.Resources not in self.obj:
+            self.obj.Resources = Dictionary()
+        elif not isinstance(self.obj.Resources, Dictionary):
+            raise TypeError("Page /Resources exists but is not a dictionary")
+        return self.obj.Resources
+
+    def add_resource(
+        self,
+        res: Object,
+        res_type: Name,
+        name: Name | None = None,
+        *,
+        prefix: str = '',
+        replace_existing: bool = True,
+    ) -> Name:
+        resources = self.resources
+        if res_type not in resources:
+            resources[res_type] = Dictionary()
+
+        if name is not None and prefix:
+            raise ValueError("Must specify one of name= or prefix=")
+        if name is None:
+            name = Name.random(prefix=prefix)
+
+        for res_dict in resources.as_dict().values():
+            if not isinstance(res_dict, Dictionary):
+                continue
+            if name in res_dict:
+                if replace_existing:
+                    del res_dict[name]
+                else:
+                    raise ValueError(f"Name {name} already exists in page /Resources")
+
+        resources[res_type][name] = res.with_same_owner_as(self.obj)
+        return name
+
+    def _over_underlay(
+        self,
+        other,
+        rect: Rectangle | None,
+        under: bool,
+        push_stack: bool,
+        shrink: bool,
+        expand: bool,
+    ) -> Name:
+        formx = None
+        if isinstance(other, Page):
+            formx = other.as_form_xobject()
+        elif isinstance(other, Dictionary) and other.get(Name.Type) == Name.Page:
+            formx = Page(other).as_form_xobject()
+        elif (
+            isinstance(other, Stream)
+            and other.get(Name.Type) == Name.XObject
+            and other.get(Name.Subtype) == Name.Form
+        ):
+            formx = other
+
+        if formx is None:
+            raise TypeError(
+                "other object is not something we can convert to Form XObject"
+            )
+
+        if rect is None:
+            rect = Rectangle(self.trimbox)
+
+        formx_placed_name = self.add_resource(formx, Name.XObject)
+        cs = self.calc_form_xobject_placement(
+            formx, formx_placed_name, rect, allow_shrink=shrink, allow_expand=expand
+        )
+
+        if push_stack:
+            self.contents_add(b'q\n', prepend=True)  # prepend q
+            self.contents_add(b'Q\n', prepend=False)  # i.e. append Q
+
+        self.contents_add(cs, prepend=under)
+        self.contents_coalesce()
+        return formx_placed_name
+
+    def add_overlay(
+        self,
+        other: Object | Page,
+        rect: Rectangle | None = None,
+        *,
+        push_stack: bool = True,
+        shrink: bool = True,
+        expand: bool = True,
+    ) -> Name:
+        return self._over_underlay(
+            other,
+            rect,
+            under=False,
+            push_stack=push_stack,
+            expand=expand,
+            shrink=shrink,
+        )
+
+    def add_underlay(
+        self,
+        other: Object | Page,
+        rect: Rectangle | None = None,
+        *,
+        shrink: bool = True,
+        expand: bool = True,
+    ) -> Name:
+        return self._over_underlay(
+            other, rect, under=True, push_stack=False, expand=expand, shrink=shrink
+        )
+
+    def contents_add(self, contents: Stream | bytes, *, prepend: bool = False):
+        return self._contents_add(contents, prepend=prepend)
+
+    def emplace(self, other: Page, retain: Iterable[Name] | None = None):
+        # Lazy default: keeping Name.Parent out of __defaults__ avoids a
+        # persistent pikepdf.Object reference at module import time.
+        if retain is None:
+            retain = (Name.Parent,)
+        return self.obj.emplace(other.obj, retain=retain)
+
+    def __repr__(self):
+        return (
+            repr(self.obj)
+            .replace('Dictionary', 'Page', 1)
+            .replace('(Type="/Page")', '', 1)
+        )
+
+    def _repr_mimebundle_(self, include=None, exclude=None):
+        data = {}
+        bundle = {'application/pdf', 'image/svg+xml'}
+        if include:
+            bundle = {k for k in bundle if k in include}
+        if exclude:
+            bundle = {k for k in bundle if k not in exclude}
+        pagedata = _single_page_pdf(self)
+        if 'application/pdf' in bundle:
+            data['application/pdf'] = pagedata
+        if 'image/svg+xml' in bundle:
+            with suppress(FileNotFoundError, RuntimeError):
+                data['image/svg+xml'] = _mudraw(pagedata, 'svg').decode('utf-8')
+        return data
+
+
+@augments(Token)
+class Extend_Token:
+    def __repr__(self):
+        return f'pikepdf.Token({self.type_}, {self.raw_value})'
+
+
+@augments(Rectangle)
+class Extend_Rectangle:
+    def __repr__(self):
+        return f'pikepdf.Rectangle({self.llx}, {self.lly}, {self.urx}, {self.ury})'
+
+    def __hash__(self):
+        return hash((self.llx, self.lly, self.urx, self.ury))
+
+    def to_bbox(self) -> Rectangle:
+        """Returns the origin-centred bounding box that encloses this rectangle.
+
+        Create a new rectangle with the same width and height as this one, but located
+        at the origin (0, 0).
+
+        Bounding boxes represent independent coordinate systems, such as for Form
+        XObjects.
+        """
+        return Rectangle(0, 0, self.width, self.height)
+
+
+@augments(Attachments)
+class Extend_Attachments(MutableMapping):
+    def __getitem__(self, k: str) -> AttachedFileSpec:
+        filespec = self._get_filespec(k)
+        if filespec is None:
+            raise KeyError(k)
+        return filespec
+
+    def __setitem__(self, k: str, v: AttachedFileSpec | bytes) -> None:
+        if isinstance(v, bytes):
+            return self._attach_data(k, v)
+        if not v.filename:
+            v.filename = k
+        return self._add_replace_filespec(k, v)
+
+    def __delitem__(self, k: str) -> None:
+        return self._remove_filespec(k)
+
+    def __len__(self):
+        return len(self._get_all_filespecs())
+
+    def __iter__(self) -> Iterator[str]:
+        yield from self._get_all_filespecs()
+
+    def __repr__(self):
+        return f"<pikepdf._core.Attachments: {list(self)}>"
+
+
+@augments(AttachedFileSpec)
+class Extend_AttachedFileSpec:
+    @staticmethod
+    def from_filepath(
+        pdf: Pdf,
+        path: Path | str,
+        *,
+        description: str = '',
+        relationship: Name | None = None,
+    ):
+        # Lazy default: keeping Name.Unspecified out of __defaults__ avoids a
+        # persistent pikepdf.Object reference at module import time.
+        if relationship is None:
+            relationship = Name.Unspecified
+        mime, _ = mimetypes.guess_type(str(path))
+        if mime is None:
+            mime = ''
+        if not isinstance(path, Path):
+            path = Path(path)
+
+        stat = path.stat()
+        return AttachedFileSpec(
+            pdf,
+            path.read_bytes(),
+            description=description,
+            filename=str(path.name),
+            mime_type=mime,
+            creation_date=encode_pdf_date(
+                datetime.datetime.fromtimestamp(stat.st_ctime)
+            ),
+            mod_date=encode_pdf_date(datetime.datetime.fromtimestamp(stat.st_mtime)),
+            relationship=relationship,
+        )
+
+    @property
+    def relationship(self) -> Name | None:
+        return self.obj.get(Name.AFRelationship)
+
+    @relationship.setter
+    def relationship(self, value: Name | None):
+        if value is None:
+            del self.obj[Name.AFRelationship]
+        else:
+            self.obj[Name.AFRelationship] = value
+
+    def __repr__(self):
+        if self.filename:
+            return (
+                f"<pikepdf._core.AttachedFileSpec for {self.filename!r}, "
+                f"description {self.description!r}>"
+            )
+        return f"<pikepdf._core.AttachedFileSpec description {self.description!r}>"
+
+
+@augments(AttachedFile)
+class Extend_AttachedFile:
+    @property
+    def creation_date(self) -> datetime.datetime | None:
+        if not self._creation_date:
+            return None
+        return decode_pdf_date(self._creation_date)
+
+    @creation_date.setter
+    def creation_date(self, value: datetime.datetime):
+        self._creation_date = encode_pdf_date(value)
+
+    @property
+    def mod_date(self) -> datetime.datetime | None:
+        if not self._mod_date:
+            return None
+        return decode_pdf_date(self._mod_date)
+
+    @mod_date.setter
+    def mod_date(self, value: datetime.datetime):
+        self._mod_date = encode_pdf_date(value)
+
+    def read_bytes(self) -> bytes:
+        return self.obj.read_bytes()
+
+    def __repr__(self):
+        return (
+            f'<pikepdf._core.AttachedFile objid={self.obj.objgen} size={self.size} '
+            f'mime_type={self.mime_type} creation_date={self.creation_date} '
+            f'mod_date={self.mod_date}>'
+        )
+
+
+@augments(NameTree)
+class Extend_NameTree:
+    def keys(self):
+        return KeysView(self._as_map())
+
+    def values(self):
+        return ValuesView(self._as_map())
+
+    def items(self):
+        return ItemsView(self._as_map())
+
+    get = MutableMapping.get
+    pop = MutableMapping.pop
+    popitem = MutableMapping.popitem
+    clear = MutableMapping.clear
+    update = MutableMapping.update
+    setdefault = MutableMapping.setdefault
+
+
+MutableMapping.register(NameTree)
+
+
+@augments(NumberTree)
+class Extend_NumberTree:
+    def keys(self):
+        return KeysView(self._as_map())
+
+    def values(self):
+        return ValuesView(self._as_map())
+
+    def items(self):
+        return ItemsView(self._as_map())
+
+    get = MutableMapping.get
+    pop = MutableMapping.pop
+    popitem = MutableMapping.popitem
+    clear = MutableMapping.clear
+    update = MutableMapping.update
+    setdefault = MutableMapping.setdefault
+
+
+MutableMapping.register(NumberTree)
