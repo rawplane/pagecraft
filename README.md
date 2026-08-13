@@ -2,7 +2,7 @@
 
 Aplikasi CLI untuk mengonversi file gambar menjadi satu file PDF.
 
-## Instalasi
+## Instalation
 
 1. Pastikan Python 3.7+ terinstal
 2. Install dependensi:
