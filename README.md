@@ -10,7 +10,7 @@ Aplikasi CLI untuk mengonversi file gambar menjadi satu file PDF.
 pip install -r requirements.txt
 ```
 
-## Penggunaan
+## Usecase
 
 ### Konversi satu gambar:
 ```bash
