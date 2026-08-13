@@ -1,4 +1,4 @@
-# Image to PDF Converter 
+# Image to PDF Converter CLI
 
 Aplikasi CLI untuk mengonversi file gambar menjadi satu file PDF.
 
