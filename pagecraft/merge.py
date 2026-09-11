@@ -92,8 +92,8 @@ def convert_one(
         return None, f"Permission denied: {input_path}"
     except UnidentifiedImageError:
         return None, f"Invalid or corrupted image: {input_path}"
-    except img2pdf.ImageFormatError as e:
-        return None, f"Unsupported image format {input_path}: {e}"
+    except img2pdf.ImageOpenError as e:
+        return None, f"Cannot open image {input_path}: {e}"
     except Exception as e:
         return None, f"Error converting {input_path}: {e}"
 
