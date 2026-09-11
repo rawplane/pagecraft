@@ -1,0 +1,32 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "pagecraft"
+version = "0.2.0"
+description = "Convert images and HTML files into a single PDF"
+readme = "README.md"
+requires-python = ">=3.8"
+license = { text = "MIT" }
+authors = [{ name = "rawplane" }]
+dependencies = [
+    "img2pdf>=0.5.1",
+    "Pillow>=10.0.0",
+    "tqdm>=4.66.0",
+    "weasyprint>=62.0",
+    "pypdf>=4.0.0",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=7.0",
+    "pytest-cov>=4.0",
+]
+
+[project.scripts]
+pagecraft = "pagecraft.cli:main"
+
+[tool.setuptools.packages.find]
+include = ["pagecraft*"]
+exclude = ["tests*"]
