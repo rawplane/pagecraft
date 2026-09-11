@@ -1,134 +1,62 @@
-# Pagecraft
+# convert_to_pdf.py
 
-A CLI tool for converting images and HTML files into a single PDF.
+Convert images and HTML files to PDF — bisa dicampur dalam satu output PDF (misal cover HTML, lalu beberapa gambar, lalu chapter HTML lagi).
 
-## Features
+HTML dirender pakai **Playwright + headless Chromium** dengan satu browser instance yang dipakai ulang untuk semua file, jadi jauh lebih cepat daripada render ulang engine per file, dan lebih akurat untuk CSS modern (flexbox, grid, dll) dibanding engine non-browser.
 
-- Convert images (JPG, PNG, WebP, BMP, TIFF) and HTML files to PDF
-- Merge multiple inputs into one PDF (order preserved or sorted)
-- Parallel conversion (multi-core) for large batches
-- Fast path for small image-only batches (skips intermediate merge)
-- Page size options: auto (original), A4, Letter
-- Sort by name, creation time, or modification time
-- Semantic exit codes for shell scripting
-
-## Installation
-
-1. Make sure Python 3.8+ is installed.
-2. Install the system libraries required by WeasyPrint (HTML rendering):
+## Instalasi
 
 ```bash
-# Ubuntu/Debian
-sudo apt install libpango-1.0-0 libpangocairo-1.0-0 libgdk-pixbuf2.0-0 libffi-dev shared-mime-info
-# macOS
-brew install pango libffi
+pip install playwright img2pdf pillow pypdf tqdm --break-system-packages
+playwright install chromium
 ```
 
-3. Install pagecraft:
+`playwright install chromium` wajib dijalankan sekali — ini yang download binary browser-nya (bukan cuma library Python-nya).
+
+## Cara Pakai
 
 ```bash
-# Recommended (isolated environment):
-pipx install pagecraft
+# Satu file
+python convert_to_pdf.py image.jpg -o output.pdf
 
-# Or from source (development):
-pip install -e .
+# Beberapa file, urutan sesuai argumen/sorting
+python convert_to_pdf.py img1.jpg img2.png img3.webp -o merged.pdf
+
+# Semua file yang didukung di dalam folder
+python convert_to_pdf.py /path/to/images -o all_images.pdf
+
+# Paksa ukuran halaman A4
+python convert_to_pdf.py image.jpg --size a4 -o document.pdf
+
+# Urutkan berdasarkan tanggal modifikasi
+python convert_to_pdf.py images/ --sort-by modified -o sorted.pdf
+
+# HTML tunggal
+python convert_to_pdf.py page.html -o document.pdf
+
+# Campur HTML dan gambar dalam satu PDF
+python convert_to_pdf.py cover.html img1.jpg chapter2.html -o mixed.pdf
+
+# Semua file (gambar + HTML) di dalam folder
+python convert_to_pdf.py ./mixed-content/ -o all.pdf
 ```
 
-## Usage
+## Argumen
 
-### Convert a single image
-```bash
-pagecraft image.jpg -o output.pdf
-```
+| Argumen | Wajib | Deskripsi |
+|---|---|---|
+| `input` | ✅ | Satu atau lebih file gambar/HTML, atau path folder yang isinya file-file tersebut |
+| `-o`, `--output` | ✅ | Path file PDF hasil output |
+| `--size` | ❌ | `auto` (default), `a4`, atau `letter`. Untuk HTML, `auto` menghormati ukuran `@page` di CSS kalau ada |
+| `--sort-by` | ❌ | `name` (default, alfabetis), `created`, atau `modified` |
 
-### Convert multiple images
-```bash
-pagecraft img1.jpg img2.png img3.webp -o merged.pdf
-```
+## Format yang Didukung
 
-### Convert all images in a directory
-```bash
-pagecraft images/ -o all_images.pdf
-```
+- **Gambar**: `.jpg`, `.jpeg`, `.png`, `.webp`, `.bmp`, `.tiff`
+- **HTML**: `.html`, `.htm` — resource relatif (`<img src>`, `<link rel="stylesheet">`, dll) di-resolve otomatis relatif terhadap lokasi file HTML-nya
 
-### Specify the page size (A4/Letter)
-```bash
-pagecraft image.jpg --size a4 -o document.pdf
-```
+## Catatan
 
-### Sort by modification time
-```bash
-pagecraft images/ --sort-by modified -o sorted.pdf
-```
-
-### Convert a single HTML file
-```bash
-pagecraft page.html -o document.pdf
-```
-
-### Mix HTML and images (order preserved / sorted)
-```bash
-pagecraft cover.html img1.jpg chapter2.html -o mixed.pdf
-```
-
-### Convert a directory containing images and HTML
-```bash
-pagecraft mixed-content/ -o all.pdf
-```
-
-### Use 4 parallel jobs (for large batches)
-```bash
-pagecraft images/ -o out.pdf -j 4
-```
-
-## Complete Options
-
-| Argument | Description |
-| :--- | :--- |
-| `input` | Image/HTML file or directory (multiple inputs are supported) |
-| `-o, --output` | Output PDF file path *(required)* |
-| `--size` | Page size: `auto`, `a4`, `letter` *(default: `auto`)* — applies to image pages; HTML pages follow their CSS `@page` |
-| `--sort-by` | Sort by: `name`, `created`, `modified` *(default: `name`)* |
-| `-j, --jobs` | Number of parallel conversion jobs *(default: CPU count)* |
-| `--quiet` | Suppress progress output (warnings still shown) |
-| `--verbose` | Show debug-level output (per-file details) |
-
-## Exit Codes
-
-| Code | Meaning |
-| :--- | :--- |
-| `0` | Success |
-| `1` | No valid input files found |
-| `2` | Some files failed (partial success) |
-| `3` | All files failed, or output write error |
-
-## Supported Input Formats
-
-Images: `*.jpg`, `*.jpeg`, `*.png`, `*.webp`, `*.bmp`, `*.tiff`
-
-HTML: `*.html`, `*.htm` (rendered with WeasyPrint — no JavaScript support; relative `<img>`/CSS resolve from the HTML file's directory)
-
-## Performance
-
-On a 2-core machine:
-
-| Batch | Time | Peak RAM |
-| :--- | :--- | :--- |
-| 50 images | ~2.5s | ~71 MB |
-| 500 images | ~8.2s | ~87 MB |
-
-Parallel conversion uses all available CPU cores. On an 8-core machine, expect 4-5x speedup for large batches.
-
-## Development
-
-```bash
-# Install in development mode
-pip install -e ".[dev]"
-
-# Run tests
-pytest
-
-# Run benchmarks
-python -c "from PIL import Image; [Image.new('RGB',(800,600)).save(f'img_{i}.png') for i in range(50)]"
-time pagecraft img_*.png -o bench.pdf
-```
+- File yang gagal divalidasi/dirender (rusak, kosong, permission denied) akan di-skip dengan warning di stderr, bukan menghentikan seluruh proses.
+- Jika folder mengandung campuran file yang didukung dan tidak didukung, hanya file yang didukung yang diproses.
+- Urutan file dalam PDF akhir mengikuti urutan argumen `input` (untuk file individual) dan hasil sorting (`--sort-by`) untuk isi folder.
