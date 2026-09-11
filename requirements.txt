@@ -1,5 +1,0 @@
-img2pdf>=0.5.1
-Pillow>=10.0.0
-tqdm>=4.66.0
-weasyprint>=62.0
-pypdf>=4.0.0

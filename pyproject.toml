@@ -30,3 +30,21 @@ pagecraft = "pagecraft.cli:main"
 [tool.setuptools.packages.find]
 include = ["pagecraft*"]
 exclude = ["tests*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+filterwarnings = [
+    # WeasyPrint's HarfBuzz-Subset warning is informational only.
+    "ignore::DeprecationWarning:weasyprint.*",
+    # The fork() warning from PIL/fontconfig is benign for our use case
+    # (no Python-level locks are held; the parent's threads are C-level
+    # fontconfig/Cairo threads). We use fork on Linux for speed.
+    "ignore:.*use of fork\\(\\) may lead to deadlocks:DeprecationWarning",
+]
+
+[tool.ruff]
+line-length = 88
+target-version = "py38"
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I", "UP", "B"]
