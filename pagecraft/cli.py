@@ -1,6 +1,7 @@
 """Command-line interface for pagecraft."""
 
 import argparse
+import os
 import sys
 
 from pagecraft.discovery import get_input_files
@@ -21,6 +22,7 @@ Examples:
   %(prog)s page.html -o document.pdf
   %(prog)s cover.html img1.jpg chapter2.html -o mixed.pdf
   %(prog)s ./mixed-content/ -o all.pdf
+  %(prog)s images/ -o out.pdf -j 4   # use 4 parallel jobs
         """,
     )
     parser.add_argument(
@@ -43,6 +45,18 @@ Examples:
         default="name",
         help="Sort inputs by: name (alphanumeric), created (creation time), modified (default: name)",
     )
+    parser.add_argument(
+        "-j",
+        "--jobs",
+        type=int,
+        default=None,
+        help="Number of parallel conversion jobs (default: CPU count)",
+    )
+    parser.add_argument(
+        "--quiet",
+        action="store_true",
+        help="Suppress progress output (warnings still go to stderr)",
+    )
     return parser
 
 
@@ -56,7 +70,13 @@ def main() -> None:
         print("Error: No valid image or HTML files found", file=sys.stderr)
         sys.exit(1)
 
-    create_pdf(input_files, args.output, args.size)
+    create_pdf(
+        input_files,
+        args.output,
+        args.size,
+        jobs=args.jobs,
+        quiet=args.quiet,
+    )
 
 
 if __name__ == "__main__":
