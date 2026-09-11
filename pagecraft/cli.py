@@ -1,10 +1,10 @@
 """Command-line interface for pagecraft."""
 
 import argparse
-import os
 import sys
 
 from pagecraft.discovery import get_input_files
+from pagecraft.logging_config import EXIT_NO_INPUT, setup_logging
 from pagecraft.merge import create_pdf
 
 
@@ -23,6 +23,12 @@ Examples:
   %(prog)s cover.html img1.jpg chapter2.html -o mixed.pdf
   %(prog)s ./mixed-content/ -o all.pdf
   %(prog)s images/ -o out.pdf -j 4   # use 4 parallel jobs
+
+Exit codes:
+  0  success
+  1  no valid input files found
+  2  some files failed (partial success)
+  3  all files failed, or output write error
         """,
     )
     parser.add_argument(
@@ -57,6 +63,11 @@ Examples:
         action="store_true",
         help="Suppress progress output (warnings still go to stderr)",
     )
+    parser.add_argument(
+        "--verbose",
+        action="store_true",
+        help="Show debug-level output (per-file details)",
+    )
     return parser
 
 
@@ -64,19 +75,24 @@ def main() -> None:
     parser = build_parser()
     args = parser.parse_args()
 
+    setup_logging(quiet=args.quiet, verbose=args.verbose)
+
     input_files = get_input_files(args.input, args.sort_by)
 
     if not input_files:
-        print("Error: No valid image or HTML files found", file=sys.stderr)
-        sys.exit(1)
+        from pagecraft.logging_config import logger
 
-    create_pdf(
+        logger.error("No valid image or HTML files found")
+        sys.exit(EXIT_NO_INPUT)
+
+    exit_code = create_pdf(
         input_files,
         args.output,
         args.size,
         jobs=args.jobs,
         quiet=args.quiet,
     )
+    sys.exit(exit_code)
 
 
 if __name__ == "__main__":

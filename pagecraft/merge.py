@@ -2,6 +2,7 @@
 
 Phase 2: parallel conversion via ProcessPoolExecutor + streaming merge
 (lazy generator) so peak RAM stays low even for 500+ files.
+Phase 3: structured logging + semantic exit codes.
 """
 
 import io
@@ -19,6 +20,7 @@ from tqdm import tqdm
 
 from pagecraft.constants import SUPPORTED_HTML_EXTENSIONS
 from pagecraft.converters import build_layout_fun
+from pagecraft.logging_config import EXIT_PARTIAL, EXIT_SUCCESS, EXIT_TOTAL_FAIL, logger
 
 
 def _worker_init() -> None:
@@ -175,16 +177,14 @@ def _fast_path_all_images(
     except Exception as e:
         # Fast path failed (e.g. one corrupt image). Fall back to the
         # slow path which tolerates per-file failures.
-        if not quiet:
-            print(
-                f"Fast path failed ({e}); retrying with per-file conversion...",
-                file=sys.stderr,
-            )
+        logger.warning(
+            "Fast path failed (%s); retrying with per-file conversion...",
+            e,
+        )
         return -1
 
-    if not quiet:
-        print(f"Success! PDF created: {output_path}")
-        print(f"Total files processed: {len(input_files)}")
+    logger.info("Success! PDF created: %s", output_path)
+    logger.info("Total files processed: %d", len(input_files))
     return len(input_files)
 
 
@@ -194,18 +194,25 @@ def create_pdf(
     page_size: str,
     jobs: Optional[int] = None,
     quiet: bool = False,
-) -> None:
+) -> int:
+    """Convert and merge inputs into a single PDF.
+
+    Returns a semantic exit code (0=success, 2=partial, 3=total fail).
+    The caller (cli.main) is responsible for sys.exit() with this code.
+    """
     if not input_files:
-        print("Error: No valid input files to convert", file=sys.stderr)
-        sys.exit(1)
+        logger.error("No valid input files to convert")
+        return EXIT_TOTAL_FAIL
 
     n_images = sum(1 for p in input_files if not is_html_file(p))
     n_html = len(input_files) - n_images
     if not quiet:
-        print(
-            f"Processing {len(input_files)} file(s) "
-            f"({n_images} image(s), {n_html} HTML) "
-            f"with {jobs or (os.cpu_count() or 2)} job(s)..."
+        logger.info(
+            "Processing %d file(s) (%d image(s), %d HTML) with %d job(s)...",
+            len(input_files),
+            n_images,
+            n_html,
+            jobs or (os.cpu_count() or 2),
         )
 
     # Fast path: image-only batches skip pypdf merge entirely.
@@ -218,7 +225,7 @@ def create_pdf(
             input_files, output_path, page_size, quiet
         )
         if count >= 0:
-            return  # Success via fast path.
+            return EXIT_SUCCESS  # Success via fast path.
         # count == -1: fast path failed, fall through to slow path.
 
     writer = PdfWriter()
@@ -236,7 +243,7 @@ def create_pdf(
 
     for path, pdf_bytes, err in iterator:
         if pdf_bytes is None:
-            print(f"Warning: {err}", file=sys.stderr)
+            logger.warning("%s", err)
             n_failed += 1
             continue
         # Stream directly into the writer: this segment is released
@@ -247,8 +254,8 @@ def create_pdf(
         n_success += 1
 
     if n_success == 0:
-        print("Error: Failed to convert any input files", file=sys.stderr)
-        sys.exit(1)
+        logger.error("Failed to convert any input files")
+        return EXIT_TOTAL_FAIL
 
     try:
         output_path_obj = Path(output_path)
@@ -257,18 +264,15 @@ def create_pdf(
         with open(output_path, "wb") as f:
             writer.write(f)
 
-        if not quiet:
-            print(f"\nSuccess! PDF created: {output_path}")
-            print(f"Total files processed: {n_success}")
-            if n_failed:
-                print(f"Skipped (failed): {n_failed}", file=sys.stderr)
+        logger.info("Success! PDF created: %s", output_path)
+        logger.info("Total files processed: %d", n_success)
+        if n_failed:
+            logger.warning("Skipped (failed): %d", n_failed)
+        return EXIT_PARTIAL if n_failed else EXIT_SUCCESS
 
     except PermissionError:
-        print(
-            f"Error: Permission denied writing to {output_path}",
-            file=sys.stderr,
-        )
-        sys.exit(1)
+        logger.error("Permission denied writing to %s", output_path)
+        return EXIT_TOTAL_FAIL
     except Exception as e:
-        print(f"Error creating PDF: {e}", file=sys.stderr)
-        sys.exit(1)
+        logger.error("Error creating PDF: %s", e)
+        return EXIT_TOTAL_FAIL
